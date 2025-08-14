@@ -26,12 +26,13 @@ struct RtReply
 #pragma pack(pop)
 
 // Constants
-constexpr double DEGREES_PER_SECOND = 30.0;
+constexpr double DEGREES_PER_SECOND = 60.0;
 constexpr double RADIANS_PER_SECOND = DEGREES_PER_SECOND * (M_PI / 180.0);
 constexpr int CONTROL_INTERVAL_MS = 4;
 constexpr double CONTROL_INTERVAL_S = CONTROL_INTERVAL_MS / 1000.0;
 constexpr double MAX_JOYSTICK_AXIS = 32767.0;
-const int JOYSTICK_AXIS_ID = 0; // Left/Right on most gamepads
+const int JOYSTICK_AXIS_ID_S = 0; // Left/Right on most gamepads
+const int JOYSTICK_AXIS_ID_L = 1; // Up/Down on most gamepads
 const char* JOYSTICK_DEVICE_PATH = "/dev/input/js0";
 const int ROBOT_UDP_PORT = 8889;
 
@@ -95,7 +96,7 @@ public:
 
         // Start the main control loop timer
         timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(CONTROL_INTERVAL_MS),
+            std::chrono::milliseconds(1),
             std::bind(&JoystickRtController::control_loop, this));
     }
 
@@ -106,9 +107,13 @@ private:
         js_event event;
         if (read(joystick_fd_, &event, sizeof(event)) > 0) 
         {
-            if (event.type == JS_EVENT_AXIS && event.number == JOYSTICK_AXIS_ID) 
+            if (event.type == JS_EVENT_AXIS && event.number == JOYSTICK_AXIS_ID_S) 
             {
-                joystick_axis_value_ = event.value;
+                joystick_axis_value_S = event.value;
+            }
+            if (event.type == JS_EVENT_AXIS && event.number == JOYSTICK_AXIS_ID_L) 
+            {
+                joystick_axis_value_L = event.value;
             }
         } // We don't block; use the last known value if no new event
 
@@ -119,10 +124,13 @@ private:
         memset(packet.deltaRad, 0x00, sizeof(packet.deltaRad));
 
         // Calculate incremental motion for axis[0]
-        double velocity_scale = static_cast<double>(joystick_axis_value_) / MAX_JOYSTICK_AXIS;
+        double velocity_scale = static_cast<double>(joystick_axis_value_S) / MAX_JOYSTICK_AXIS;
         packet.deltaRad[0][0] = static_cast<float>(RADIANS_PER_SECOND * velocity_scale * CONTROL_INTERVAL_S);
+
+        velocity_scale = static_cast<double>(joystick_axis_value_L) / MAX_JOYSTICK_AXIS;
+        packet.deltaRad[0][1] = static_cast<float>(RADIANS_PER_SECOND * velocity_scale * CONTROL_INTERVAL_S);
         
-        RCLCPP_WARN(this->get_logger(), "Seq: %u, Joy: %d, dRad: %f", packet.sequenceId, joystick_axis_value_, packet.deltaRad[0][0]);
+        RCLCPP_WARN(this->get_logger(), "Seq: %u, Joy: %d, dRad: %f", packet.sequenceId, joystick_axis_value_S, packet.deltaRad[0][0]);
 
         // 3. Send UDP Packet
         sendto(udp_socket_fd_, &packet, sizeof(packet), 0, (struct sockaddr*)&robot_addr_, sizeof(robot_addr_));
@@ -193,7 +201,8 @@ private:
 
     uint32_t sequence_id_;
     int joystick_fd_;
-    int16_t joystick_axis_value_ = 0;
+    int16_t joystick_axis_value_S = 0;
+    int16_t joystick_axis_value_L = 0;
 
     int udp_socket_fd_;
     struct sockaddr_in robot_addr_;
