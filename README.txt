@@ -8,4 +8,5 @@ rosdep update
 rosdep install -i --from-path src -y
 source install/setup.bash
 
+chmod a+r /dev/input/js0
 ros2 run rt_control rt_control_node --ros-args -p robot_ip:=192.168.1.31
