@@ -4,6 +4,7 @@ sudo docker run --device=/dev/input/js0:/dev/input/js0 -it -e DISPLAY=$DISPLAY -
 source /opt/ros/jazzy/setup.bash
 
 cd /home/ted/motoros2_moveit2_config_packages
+apt update
 rosdep update
 rosdep install -i --from-path src -y
 source install/setup.bash
