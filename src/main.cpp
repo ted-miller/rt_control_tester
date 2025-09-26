@@ -178,6 +178,9 @@ public:
         if (joystick_thread_.joinable()) {
             joystick_thread_.join();
         }
+        if (control_thread_.joinable()) {
+            control_thread_.join();
+        }
 
         if (joystick_fd_ != -1) { close(joystick_fd_); }
         if (udp_socket_fd_ != -1) { close(udp_socket_fd_); }
@@ -244,10 +247,7 @@ public:
         }
 
         joystick_thread_ = std::thread(&JoystickRtController::joystick_poll_thread, this);
-
-        timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(CONTROL_INTERVAL_MS),
-            std::bind(&JoystickRtController::control_loop, this));
+        control_thread_ = std::thread(&JoystickRtController::control_loop_thread, this);
     }
 
 private:
@@ -280,8 +280,10 @@ private:
         RCLCPP_INFO(this->get_logger(), "Joystick polling thread stopped.");
     }
 
-    // UPDATED: Control loop logic for Cartesian translation and rotation.
-    void control_loop() 
+    void control_loop_thread() 
+    {
+        RCLCPP_INFO(this->get_logger(), "Control loop thread started.");
+        while(running_)
     {
         RtPacket packet{};
         packet.sequenceId = sequence_id_++;
@@ -313,8 +315,6 @@ private:
             packet.delta[0][1] = speed_limit_mps_ * (y_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
             // D-Pad Up/Down -> +/- Z
             packet.delta[0][2] = speed_limit_mps_ * (z_dpad_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-
-            //RCLCPP_INFO(this->get_logger(), "packet.delta[0][0] = %.5f", packet.delta[0][0]);
         }
         
         // Send UDP Packet
@@ -325,6 +325,8 @@ private:
         socklen_t addr_len = sizeof(robot_addr_);
         recvfrom(udp_socket_fd_, &reply, sizeof(reply), 0, (struct sockaddr*)&robot_addr_, &addr_len);
         // Error/mismatch check would go here
+    }
+        RCLCPP_INFO(this->get_logger(), "Control loop thread stopped.");
     }
 
     bool setup_joystick()
@@ -360,7 +362,6 @@ private:
 
     // ROS2 Members
     rclcpp::Client<motoros2_interfaces::srv::StartRtMode>::SharedPtr client_;
-    rclcpp::TimerBase::SharedPtr timer_;
 
     // Configuration Members
     std::string robot_ip_;
@@ -377,6 +378,7 @@ private:
     
     // Threading Members
     std::thread joystick_thread_;
+    std::thread control_thread_;
     std::atomic<bool> running_;
     std::atomic<bool> trigger_pressed_;
     std::array<std::atomic<int16_t>, MAX_JOYSTICK_AXES> axis_states_;
