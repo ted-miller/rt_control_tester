@@ -72,7 +72,7 @@ typedef enum
 //                  !All data is little-endian!
 //##########################################################################
 
-struct RtPacket 
+struct RtPacket
 {
     unsigned int sequenceId;
     
@@ -102,7 +102,7 @@ struct RtPacket
 //                  !All data is little-endian!
 //##########################################################################
 
-struct RtReply 
+struct RtReply
 {
     unsigned int sequenceEcho;
 
@@ -284,48 +284,48 @@ private:
     {
         RCLCPP_INFO(this->get_logger(), "Control loop thread started.");
         while(running_)
-    {
-        RtPacket packet{};
-        packet.sequenceId = sequence_id_++;
-        
-        memset(packet.delta, 0x00, sizeof(packet.delta));
-
-        // Get current joystick state
-        double x_axis_val = static_cast<double>(axis_states_[axis_x_].load());
-        double y_axis_val = static_cast<double>(axis_states_[axis_y_].load());
-        double z_dpad_val = static_cast<double>(axis_states_[axis_z_dpad_].load());
-        bool is_rotating = trigger_pressed_.load();
-
-        if (is_rotating)
         {
-            // --- ROTATION MODE ---
-            // Fwd/Back stick -> Pitch (rotation around Y)
-            packet.delta[0][4] = rot_speed_rps_ * (x_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-            // Left/Right stick -> Roll (rotation around X)
-            packet.delta[0][3] = rot_speed_rps_ * (y_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-            // D-Pad Up/Down -> Yaw (rotation around Z)
-            packet.delta[0][5] = rot_speed_rps_ * (z_dpad_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-        }
-        else
-        {
-            // --- TRANSLATION MODE ---
-            // Fwd/Back stick -> +/- X
-            packet.delta[0][0] = speed_limit_mps_ * (x_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-            // Left/Right stick -> +/- Y
-            packet.delta[0][1] = speed_limit_mps_ * (y_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-            // D-Pad Up/Down -> +/- Z
-            packet.delta[0][2] = speed_limit_mps_ * (z_dpad_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-        }
-        
-        // Send UDP Packet
-        sendto(udp_socket_fd_, &packet, sizeof(packet), 0, (struct sockaddr*)&robot_addr_, sizeof(robot_addr_));
+            RtPacket packet{};
+            packet.sequenceId = sequence_id_++;
+            
+            memset(packet.delta, 0x00, sizeof(packet.delta));
 
-        // Listen for Reply
-        RtReply reply{};
-        socklen_t addr_len = sizeof(robot_addr_);
-        recvfrom(udp_socket_fd_, &reply, sizeof(reply), 0, (struct sockaddr*)&robot_addr_, &addr_len);
-        // Error/mismatch check would go here
-    }
+            // Get current joystick state
+            double x_axis_val = static_cast<double>(axis_states_[axis_x_].load());
+            double y_axis_val = static_cast<double>(axis_states_[axis_y_].load());
+            double z_dpad_val = static_cast<double>(axis_states_[axis_z_dpad_].load());
+            bool is_rotating = trigger_pressed_.load();
+
+            if (is_rotating)
+            {
+                // --- ROTATION MODE ---
+                // Fwd/Back stick -> Pitch (rotation around Y)
+                packet.delta[0][4] = rot_speed_rps_ * (x_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
+                // Left/Right stick -> Roll (rotation around X)
+                packet.delta[0][3] = rot_speed_rps_ * (y_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
+                // D-Pad Up/Down -> Yaw (rotation around Z)
+                packet.delta[0][5] = rot_speed_rps_ * (z_dpad_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
+            }
+            else
+            {
+                // --- TRANSLATION MODE ---
+                // Fwd/Back stick -> +/- X
+                packet.delta[0][0] = speed_limit_mps_ * (x_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
+                // Left/Right stick -> +/- Y
+                packet.delta[0][1] = speed_limit_mps_ * (y_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
+                // D-Pad Up/Down -> +/- Z
+                packet.delta[0][2] = speed_limit_mps_ * (z_dpad_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
+            }
+            
+            // Send UDP Packet
+            sendto(udp_socket_fd_, &packet, sizeof(packet), 0, (struct sockaddr*)&robot_addr_, sizeof(robot_addr_));
+
+            // Listen for Reply
+            RtReply reply{};
+            socklen_t addr_len = sizeof(robot_addr_);
+            recvfrom(udp_socket_fd_, &reply, sizeof(reply), 0, (struct sockaddr*)&robot_addr_, &addr_len);
+            // Error/mismatch check would go here
+        }
         RCLCPP_INFO(this->get_logger(), "Control loop thread stopped.");
     }
 
