@@ -9,6 +9,8 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(motoros2_interfaces REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(std_srvs REQUIRED)
+
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
@@ -23,7 +25,7 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(rt_control_node src/main.cpp)
-ament_target_dependencies(rt_control_node rclcpp motoros2_interfaces)
+ament_target_dependencies(rt_control_node rclcpp motoros2_interfaces std_srvs)
 
 install(TARGETS
   rt_control_node

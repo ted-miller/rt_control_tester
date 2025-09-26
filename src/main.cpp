@@ -1,5 +1,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <motoros2_interfaces/srv/start_rt_mode.hpp>
+#include <motoros2_interfaces/srv/reset_error.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -89,6 +91,38 @@ public:
 
     void initialize() 
     {
+        auto reset_client = this->create_client<motoros2_interfaces::srv::ResetError>("reset_error");
+        RCLCPP_INFO(this->get_logger(), "Waiting for 'reset_error' service...");
+        if (!reset_client->wait_for_service(std::chrono::seconds(5))) {
+             RCLCPP_ERROR(this->get_logger(), "Service 'reset_error' not available. Exiting.");
+             rclcpp::shutdown();
+             return;
+        }
+        auto reset_request = std::make_shared<motoros2_interfaces::srv::ResetError::Request>();
+        auto reset_result_future = reset_client->async_send_request(reset_request);
+        RCLCPP_INFO(this->get_logger(), "Calling ResetError service...");
+        if (rclcpp::spin_until_future_complete(this->get_node_base_interface(), reset_result_future) != rclcpp::FutureReturnCode::SUCCESS) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to call service reset_error");
+            return;
+        }
+        RCLCPP_INFO(this->get_logger(), "Successfully reset errors.");
+
+        auto stop_traj_client = this->create_client<std_srvs::srv::Trigger>("stop_traj_mode");
+        RCLCPP_INFO(this->get_logger(), "Waiting for 'stop_traj_mode' service...");
+        if (!stop_traj_client->wait_for_service(std::chrono::seconds(5))) {
+             RCLCPP_ERROR(this->get_logger(), "Service 'stop_traj_mode' not available. Exiting.");
+             rclcpp::shutdown();
+             return;
+        }
+        auto stop_traj_request = std::make_shared<std_srvs::srv::Trigger::Request>();
+        auto stop_traj_future = stop_traj_client->async_send_request(stop_traj_request);
+        RCLCPP_INFO(this->get_logger(), "Calling StopTrajMode service...");
+        if (rclcpp::spin_until_future_complete(this->get_node_base_interface(), stop_traj_future) != rclcpp::FutureReturnCode::SUCCESS) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to call service stop_traj_mode");
+            return;
+        }
+        RCLCPP_INFO(this->get_logger(), "Successfully stopped trajectory mode.");
+
         client_ = this->create_client<motoros2_interfaces::srv::StartRtMode>("start_rt_mode");
         RCLCPP_INFO(this->get_logger(), "Waiting for 'start_rt_mode' service...");
         if (!client_->wait_for_service(std::chrono::seconds(5))) {
