@@ -12,14 +12,13 @@
 #include <cmath> // For M_PI
 
 // Linux/Network specific headers
-#include <fcntl.h>
-#include <linux/joystick.h>
+// REMOVED: fcntl.h and linux/joystick.h are no longer needed
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 
-// CHANGED: The packet structure now sends 6 cartesian increments.
+// The packet structure now sends 6 cartesian increments.
 // X, Y, Z in meters; Rx, Ry, Rz in radians.
 #pragma pack(push, 1)
 typedef enum
@@ -56,7 +55,7 @@ typedef enum
     TCP_Y,
     TCP_Z,
 
-    TCP_Rx,         //0.0001 degrees
+    TCP_Rx,         //radians
     TCP_Ry,
     TCP_Rz,
     TCP_Re,
@@ -133,57 +132,27 @@ struct RtReply
 // Constants
 constexpr int CONTROL_INTERVAL_MS = 4;
 constexpr double CONTROL_INTERVAL_S = CONTROL_INTERVAL_MS / 1000.0;
-constexpr double MAX_JOYSTICK_AXIS_VALUE = 32767.0;
-const int MAX_JOYSTICK_AXES = 8;
-const int MAX_JOYSTICK_BUTTONS = 12; // Max buttons to consider
 const int ROBOT_UDP_PORT = 8889; // Standard RT motion port
 
-class JoystickRtController : public rclcpp::Node 
+// CHANGED: Renamed class to reflect its new purpose
+class FixedRotationController : public rclcpp::Node 
 {
 public:
-    JoystickRtController() : Node("rt_joystick_controller_node"), sequence_id_(0), joystick_fd_(-1), udp_socket_fd_(-1), running_(true), trigger_pressed_(false)
+    FixedRotationController() : Node("fixed_rotation_controller_node"), sequence_id_(0), udp_socket_fd_(-1), running_(true)
     {
         this->declare_parameter<std::string>("robot_ip", "192.168.1.31");
-        
-        // NEW: Parameters for Cartesian control
-        this->declare_parameter<std::string>("joystick_device", "/dev/input/js0");
-        this->declare_parameter<double>("speed_limit_mps", 0.8);
-        this->declare_parameter<double>("rot_speed_limit_dps", 60.0); // 60 deg/sec
-        //this->declare_parameter<double>("rot_speed_limit_dps", 25.0); // 25 deg/sec
-        
-        // NEW: Joystick axis and button mapping parameters
-        this->declare_parameter<int>("axis_x", 1); // Fwd/Back on left stick
-        this->declare_parameter<int>("axis_y", 0); // Left/Right on left stick
-        this->declare_parameter<int>("axis_z_dpad", 7); // Up/Down on D-pad/hat
-        this->declare_parameter<int>("button_trigger", 0); // Main trigger button
-
-        // Read parameters
         robot_ip_ = this->get_parameter("robot_ip").as_string();
-        joystick_device_ = this->get_parameter("joystick_device").as_string();
-        speed_limit_mps_ = this->get_parameter("speed_limit_mps").as_double();
-        axis_x_ = this->get_parameter("axis_x").as_int();
-        axis_y_ = this->get_parameter("axis_y").as_int();
-        axis_z_dpad_ = this->get_parameter("axis_z_dpad").as_int();
-        button_trigger_ = this->get_parameter("button_trigger").as_int();
-
-        double rot_speed_dps = this->get_parameter("rot_speed_limit_dps").as_double();
-        rot_speed_rps_ = rot_speed_dps * (M_PI / 180.0);
-        
-        // Initialize atomic state arrays
-        for(auto& state : axis_states_) { state.store(0); }
     }
 
-    ~JoystickRtController() 
+    ~FixedRotationController() 
     {
         running_ = false;
-        if (joystick_thread_.joinable()) {
-            joystick_thread_.join();
-        }
+        // REMOVED: joystick_thread_ is gone
         if (control_thread_.joinable()) {
             control_thread_.join();
         }
 
-        if (joystick_fd_ != -1) { close(joystick_fd_); }
+        // REMOVED: joystick_fd_ is gone
         if (udp_socket_fd_ != -1) { close(udp_socket_fd_); }
         RCLCPP_INFO(this->get_logger(), "Resources cleaned up. Shutting down.");
     }
@@ -241,82 +210,48 @@ public:
         }
 
         RCLCPP_INFO(this->get_logger(), "Successfully started real-time mode.");
-        if (!setup_joystick() || !setup_udp_socket()) {
+        
+        // REMOVED: call to setup_joystick()
+        if (!setup_udp_socket()) {
             RCLCPP_ERROR(this->get_logger(), "Failed to setup hardware. Shutting down.");
             rclcpp::shutdown();
             return;
         }
 
-        joystick_thread_ = std::thread(&JoystickRtController::joystick_poll_thread, this);
-        control_thread_ = std::thread(&JoystickRtController::control_loop_thread, this);
+        // REMOVED: joystick_thread_ creation
+        control_thread_ = std::thread(&FixedRotationController::control_loop_thread, this);
     }
 
 private:
-    // UPDATED: This thread now also reads button events.
-    void joystick_poll_thread()
-    {
-        RCLCPP_INFO(this->get_logger(), "Joystick polling thread started.");
-        js_event event;
-        while(running_)
-        {
-            if (read(joystick_fd_, &event, sizeof(event)) > 0)
-            {
-                if (event.type & JS_EVENT_AXIS)
-                {
-                    if (event.number < MAX_JOYSTICK_AXES)
-                    {
-                        axis_states_[event.number].store(event.value);
-                    }
-                }
-                else if (event.type & JS_EVENT_BUTTON)
-                {
-                    if (event.number == button_trigger_)
-                    {
-                        trigger_pressed_.store(event.value != 0);
-                    }
-                }
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        RCLCPP_INFO(this->get_logger(), "Joystick polling thread stopped.");
-    }
+    // REMOVED: The joystick_poll_thread is no longer needed.
 
+    // CHANGED: This thread now sends a pre-defined motion instead of reading from a joystick.
     void control_loop_thread() 
     {
-        RCLCPP_INFO(this->get_logger(), "Control loop thread started.");
-        while(running_)
+        RCLCPP_INFO(this->get_logger(), "Control loop thread started. Executing fixed rotation...");
+
+        // --- Define the motion ---
+        const double total_angle_deg = 45.0; // The total rotation angle in degrees
+        const double duration_s = 2.0;       // The time over which to perform the rotation
+
+        // --- Calculate motion parameters ---
+        const double total_angle_rad = total_angle_deg * (M_PI / 180.0);
+        const int num_steps = static_cast<int>(duration_s / CONTROL_INTERVAL_S);
+        const double rotation_per_step_rad = total_angle_rad / num_steps;
+
+        RCLCPP_INFO(this->get_logger(), "Rotating %.1f deg over %.1f s in %d steps.", total_angle_deg, duration_s, num_steps);
+
+        for (int i = 0; i < num_steps && running_; ++i)
         {
             RtPacket packet{};
             packet.sequenceId = sequence_id_++;
             
+            // Initialize all deltas to zero
             memset(packet.delta, 0x00, sizeof(packet.delta));
 
-            // Get current joystick state
-            double x_axis_val = static_cast<double>(axis_states_[axis_x_].load());
-            double y_axis_val = static_cast<double>(axis_states_[axis_y_].load());
-            double z_dpad_val = static_cast<double>(axis_states_[axis_z_dpad_].load());
-            bool is_rotating = trigger_pressed_.load();
-
-            if (is_rotating)
-            {
-                // --- ROTATION MODE ---
-                // Fwd/Back stick -> Pitch (rotation around Y)
-                packet.delta[0][4] = rot_speed_rps_ * (x_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-                // Left/Right stick -> Roll (rotation around X)
-                packet.delta[0][3] = rot_speed_rps_ * (y_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-                // D-Pad Up/Down -> Yaw (rotation around Z)
-                packet.delta[0][5] = rot_speed_rps_ * (z_dpad_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-            }
-            else
-            {
-                // --- TRANSLATION MODE ---
-                // Fwd/Back stick -> +/- X
-                packet.delta[0][0] = speed_limit_mps_ * (x_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-                // Left/Right stick -> +/- Y
-                packet.delta[0][1] = speed_limit_mps_ * (y_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-                // D-Pad Up/Down -> +/- Z
-                packet.delta[0][2] = speed_limit_mps_ * (z_dpad_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-            }
+            // Set the rotation for the X-axis (Roll)
+            // The index for TCP_Rx is 3 as per the CartesianIndeces enum.
+            packet.delta[Group_1][TCP_Rx] = rotation_per_step_rad;
             
             // Send UDP Packet
             sendto(udp_socket_fd_, &packet, sizeof(packet), 0, (struct sockaddr*)&robot_addr_, sizeof(robot_addr_));
@@ -328,21 +263,26 @@ private:
 
             // Error/mismatch check would go here
             if (reply.fsuInterferenceDetected)
-                RCLCPP_ERROR(this->get_logger(), "You are being slowed down");
+            {
+                RCLCPP_WARN(this->get_logger(), "FSU interference detected. Robot may be slowed down.");
+            }
+
+            // Wait for the next control interval
+            std::this_thread::sleep_for(std::chrono::milliseconds(CONTROL_INTERVAL_MS));
         }
+        
+        // --- Motion Complete ---
+        if (running_)
+        {
+            RCLCPP_INFO(this->get_logger(), "Fixed rotation complete. Shutting down.");
+            running_ = false;
+            rclcpp::shutdown(); // Request shutdown of the ROS 2 node
+        }
+
         RCLCPP_INFO(this->get_logger(), "Control loop thread stopped.");
     }
 
-    bool setup_joystick()
-    {
-        joystick_fd_ = open(joystick_device_.c_str(), O_RDONLY | O_NONBLOCK);
-        if (joystick_fd_ < 0) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to open joystick at %s", joystick_device_.c_str());
-            return false;
-        }
-        RCLCPP_INFO(this->get_logger(), "Joystick '%s' opened successfully.", joystick_device_.c_str());
-        return true;
-    }
+    // REMOVED: The setup_joystick function is no longer needed.
 
     bool setup_udp_socket() 
     {
@@ -369,29 +309,22 @@ private:
 
     // Configuration Members
     std::string robot_ip_;
-    std::string joystick_device_;
-    double speed_limit_mps_;
-    double rot_speed_rps_;
-    int axis_x_, axis_y_, axis_z_dpad_, button_trigger_;
     
     // State & Networking Members
     uint32_t sequence_id_;
-    int joystick_fd_;
     int udp_socket_fd_;
     struct sockaddr_in robot_addr_;
     
     // Threading Members
-    std::thread joystick_thread_;
     std::thread control_thread_;
     std::atomic<bool> running_;
-    std::atomic<bool> trigger_pressed_;
-    std::array<std::atomic<int16_t>, MAX_JOYSTICK_AXES> axis_states_;
 };
 
 int main(int argc, char** argv) 
 {
     rclcpp::init(argc, argv);
-    auto node = std::make_shared<JoystickRtController>();
+    // CHANGED: Instantiated the new class
+    auto node = std::make_shared<FixedRotationController>();
     node->initialize();
     rclcpp::spin(node);
     rclcpp::shutdown();
