@@ -149,6 +149,7 @@ public:
         this->declare_parameter<std::string>("joystick_device", "/dev/input/js0");
         this->declare_parameter<double>("speed_limit_mps", 0.8);
         this->declare_parameter<double>("rot_speed_limit_dps", 60.0); // 60 deg/sec
+        //this->declare_parameter<double>("rot_speed_limit_dps", 25.0); // 25 deg/sec
         
         // NEW: Joystick axis and button mapping parameters
         this->declare_parameter<int>("axis_x", 1); // Fwd/Back on left stick
@@ -324,7 +325,10 @@ private:
             RtReply reply{};
             socklen_t addr_len = sizeof(robot_addr_);
             recvfrom(udp_socket_fd_, &reply, sizeof(reply), 0, (struct sockaddr*)&robot_addr_, &addr_len);
+
             // Error/mismatch check would go here
+            if (reply.fsuInterferenceDetected)
+                RCLCPP_ERROR(this->get_logger(), "You are being slowed down");
         }
         RCLCPP_INFO(this->get_logger(), "Control loop thread stopped.");
     }
