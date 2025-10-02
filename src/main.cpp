@@ -19,8 +19,6 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 
-// CHANGED: The packet structure now sends 6 cartesian increments.
-// X, Y, Z in meters; Rx, Ry, Rz in radians.
 #pragma pack(push, 1)
 typedef enum
 {
@@ -147,27 +145,32 @@ public:
         
         // NEW: Parameters for Cartesian control
         this->declare_parameter<std::string>("joystick_device", "/dev/input/js0");
-        this->declare_parameter<double>("speed_limit_mps", 0.8);
-        this->declare_parameter<double>("rot_speed_limit_dps", 60.0); // 60 deg/sec
-        //this->declare_parameter<double>("rot_speed_limit_dps", 25.0); // 25 deg/sec
-        
+        this->declare_parameter<double>("speed_limit_s", 1);
+        this->declare_parameter<double>("speed_limit_l", 1);
+        this->declare_parameter<double>("speed_limit_u", 1);
+        this->declare_parameter<double>("speed_limit_r", 1);
+        this->declare_parameter<double>("speed_limit_b", 1);
+        this->declare_parameter<double>("speed_limit_t", 1);
+
         // NEW: Joystick axis and button mapping parameters
-        this->declare_parameter<int>("axis_x", 1); // Fwd/Back on left stick
-        this->declare_parameter<int>("axis_y", 0); // Left/Right on left stick
-        this->declare_parameter<int>("axis_z_dpad", 5); // Up/Down on D-pad/hat
+        this->declare_parameter<int>("axis_s_r", 1); // Fwd/Back on left stick
+        this->declare_parameter<int>("axis_l_b", 0); // Left/Right on left stick
+        this->declare_parameter<int>("axis_u_t", 5); // Up/Down on D-pad/hat
         this->declare_parameter<int>("button_trigger", 0); // Main trigger button
 
         // Read parameters
         robot_ip_ = this->get_parameter("robot_ip").as_string();
         joystick_device_ = this->get_parameter("joystick_device").as_string();
-        speed_limit_mps_ = this->get_parameter("speed_limit_mps").as_double();
-        axis_x_ = this->get_parameter("axis_x").as_int();
-        axis_y_ = this->get_parameter("axis_y").as_int();
-        axis_z_dpad_ = this->get_parameter("axis_z_dpad").as_int();
+        speed_limit_s_ = this->get_parameter("speed_limit_s").as_double();
+        speed_limit_l_ = this->get_parameter("speed_limit_l").as_double();
+        speed_limit_u_ = this->get_parameter("speed_limit_u").as_double();
+        speed_limit_r_ = this->get_parameter("speed_limit_r").as_double();
+        speed_limit_b_ = this->get_parameter("speed_limit_b").as_double();
+        speed_limit_t_ = this->get_parameter("speed_limit_t").as_double();
+        axis_s_r_ = this->get_parameter("axis_s_r").as_int();
+        axis_l_b_ = this->get_parameter("axis_l_b").as_int();
+        axis_u_t_ = this->get_parameter("axis_u_t").as_int();
         button_trigger_ = this->get_parameter("button_trigger").as_int();
-
-        double rot_speed_dps = this->get_parameter("rot_speed_limit_dps").as_double();
-        rot_speed_rps_ = rot_speed_dps * (M_PI / 180.0);
         
         // Initialize atomic state arrays
         for(auto& state : axis_states_) { state.store(0); }
@@ -230,7 +233,7 @@ public:
         }
 
         auto request = std::make_shared<motoros2_interfaces::srv::StartRtMode::Request>();
-        request->control_mode.value = motoros2_interfaces::msg::ControlModeEnum::CARTESIAN;
+        request->control_mode.value = motoros2_interfaces::msg::ControlModeEnum::JOINT_ANGLES;
         auto result_future = client_->async_send_request(request);
 
         RCLCPP_INFO(this->get_logger(), "Calling StartRtMode service...");
@@ -242,8 +245,7 @@ public:
         auto start_rt_mode_result = result_future.get();
         if (start_rt_mode_result->result_code.value != motoros2_interfaces::msg::MotionReadyEnum::READY)
         {
-            RCLCPP_ERROR(this->get_logger(), "start_rt_mode returned code %d: %s", 
-                         start_rt_mode_result->result_code.value, start_rt_mode_result->message.c_str());
+            RCLCPP_ERROR(this->get_logger(), "start_rt_mode returned code %d: %s", start_rt_mode_result->result_code.value, start_rt_mode_result->message.c_str());
             return false;
         }
 
@@ -255,7 +257,6 @@ public:
 
         joystick_thread_ = std::thread(&JoystickRtController::joystick_poll_thread, this);
         control_thread_ = std::thread(&JoystickRtController::control_loop_thread, this);
-
         return true;
     }
 
@@ -300,32 +301,23 @@ private:
             memset(packet.delta, 0x00, sizeof(packet.delta));
 
             // Get current joystick state
-            double x_axis_val = static_cast<double>(axis_states_[axis_x_].load());
-            double y_axis_val = static_cast<double>(axis_states_[axis_y_].load());
-            double z_dpad_val = static_cast<double>(axis_states_[axis_z_dpad_].load());
-            bool is_rotating = trigger_pressed_.load();
+            double s_r_val = static_cast<double>(axis_states_[axis_s_r_].load());
+            double l_b_val = static_cast<double>(axis_states_[axis_l_b_].load());
+            double u_t_val = static_cast<double>(axis_states_[axis_u_t_].load());
+            bool SLU = !trigger_pressed_.load();
 
-            if (is_rotating)
+            if (SLU)
             {
-                // --- ROTATION MODE ---
-                // Fwd/Back stick -> Pitch (rotation around Y)
-                packet.delta[0][4] = rot_speed_rps_ * (x_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-                // Left/Right stick -> Roll (rotation around X)
-                packet.delta[0][3] = rot_speed_rps_ * (y_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-                // D-Pad Up/Down -> Yaw (rotation around Z)
-                packet.delta[0][5] = rot_speed_rps_ * (z_dpad_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
+                packet.delta[0][0] = speed_limit_s_ * (s_r_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
+                packet.delta[0][1] = speed_limit_l_ * (l_b_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
+                packet.delta[0][2] = speed_limit_u_ * (u_t_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
             }
             else
             {
-                // --- TRANSLATION MODE ---
-                // Fwd/Back stick -> +/- X
-                packet.delta[0][0] = speed_limit_mps_ * (x_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-                // Left/Right stick -> +/- Y
-                packet.delta[0][1] = speed_limit_mps_ * (y_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-                // D-Pad Up/Down -> +/- Z
-                packet.delta[0][2] = speed_limit_mps_ * (z_dpad_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
+                packet.delta[0][3] = speed_limit_r_ * (s_r_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
+                packet.delta[0][4] = speed_limit_b_ * (l_b_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
+                packet.delta[0][5] = speed_limit_t_ * (u_t_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
             }
-            
             // Send UDP Packet
             sendto(udp_socket_fd_, &packet, sizeof(packet), 0, (struct sockaddr*)&robot_addr_, sizeof(robot_addr_));
 
@@ -378,9 +370,9 @@ private:
     // Configuration Members
     std::string robot_ip_;
     std::string joystick_device_;
-    double speed_limit_mps_;
-    double rot_speed_rps_;
-    int axis_x_, axis_y_, axis_z_dpad_, button_trigger_;
+    double speed_limit_s_, speed_limit_l_, speed_limit_u_, speed_limit_r_, speed_limit_b_, speed_limit_t_;
+    
+    int axis_s_r_, axis_l_b_, axis_u_t_, button_trigger_;
     
     // State & Networking Members
     uint32_t sequence_id_;
@@ -400,7 +392,7 @@ int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<JoystickRtController>();
-    if (node->initialize())
+    if(node->initialize())
         rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
