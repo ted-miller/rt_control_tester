@@ -188,21 +188,21 @@ public:
         RCLCPP_INFO(this->get_logger(), "Resources cleaned up. Shutting down.");
     }
 
-    void initialize() 
+    bool initialize() 
     {
         auto reset_client = this->create_client<motoros2_interfaces::srv::ResetError>("reset_error");
         RCLCPP_INFO(this->get_logger(), "Waiting for 'reset_error' service...");
         if (!reset_client->wait_for_service(std::chrono::seconds(5))) {
              RCLCPP_ERROR(this->get_logger(), "Service 'reset_error' not available. Exiting.");
              rclcpp::shutdown();
-             return;
+             return false;
         }
         auto reset_request = std::make_shared<motoros2_interfaces::srv::ResetError::Request>();
         auto reset_result_future = reset_client->async_send_request(reset_request);
         RCLCPP_INFO(this->get_logger(), "Calling ResetError service...");
         if (rclcpp::spin_until_future_complete(this->get_node_base_interface(), reset_result_future) != rclcpp::FutureReturnCode::SUCCESS) {
             RCLCPP_ERROR(this->get_logger(), "Failed to call service reset_error");
-            return;
+            return false;
         }
         RCLCPP_INFO(this->get_logger(), "Successfully reset errors.");
 
@@ -210,15 +210,14 @@ public:
         RCLCPP_INFO(this->get_logger(), "Waiting for 'stop_traj_mode' service...");
         if (!stop_traj_client->wait_for_service(std::chrono::seconds(5))) {
              RCLCPP_ERROR(this->get_logger(), "Service 'stop_traj_mode' not available. Exiting.");
-             rclcpp::shutdown();
-             return;
+             return false;
         }
         auto stop_traj_request = std::make_shared<std_srvs::srv::Trigger::Request>();
         auto stop_traj_future = stop_traj_client->async_send_request(stop_traj_request);
         RCLCPP_INFO(this->get_logger(), "Calling StopTrajMode service...");
         if (rclcpp::spin_until_future_complete(this->get_node_base_interface(), stop_traj_future) != rclcpp::FutureReturnCode::SUCCESS) {
             RCLCPP_ERROR(this->get_logger(), "Failed to call service stop_traj_mode");
-            return;
+            return false;
         }
         RCLCPP_INFO(this->get_logger(), "Successfully stopped trajectory mode.");
 
@@ -227,7 +226,7 @@ public:
         if (!client_->wait_for_service(std::chrono::seconds(5))) {
              RCLCPP_ERROR(this->get_logger(), "Service 'start_rt_mode' not available. Exiting.");
              rclcpp::shutdown();
-             return;
+             return false;
         }
 
         auto request = std::make_shared<motoros2_interfaces::srv::StartRtMode::Request>();
@@ -237,18 +236,27 @@ public:
         RCLCPP_INFO(this->get_logger(), "Calling StartRtMode service...");
         if (rclcpp::spin_until_future_complete(this->get_node_base_interface(), result_future) != rclcpp::FutureReturnCode::SUCCESS) {
             RCLCPP_ERROR(this->get_logger(), "Failed to call service start_rt_mode");
-            return;
+            return false;
+        }
+
+        auto start_rt_mode_result = result_future.get();
+        if (start_rt_mode_result->result_code.value != motoros2_interfaces::msg::MotionReadyEnum::READY)
+        {
+            RCLCPP_ERROR(this->get_logger(), "start_rt_mode returned code %d: %s", 
+                         start_rt_mode_result->result_code.value, start_rt_mode_result->message.c_str());
+            return false;
         }
 
         RCLCPP_INFO(this->get_logger(), "Successfully started real-time mode.");
         if (!setup_joystick() || !setup_udp_socket()) {
             RCLCPP_ERROR(this->get_logger(), "Failed to setup hardware. Shutting down.");
-            rclcpp::shutdown();
-            return;
+            return false;
         }
 
         joystick_thread_ = std::thread(&JoystickRtController::joystick_poll_thread, this);
         control_thread_ = std::thread(&JoystickRtController::control_loop_thread, this);
+
+        return true;
     }
 
 private:
@@ -392,8 +400,8 @@ int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<JoystickRtController>();
-    node->initialize();
-    rclcpp::spin(node);
+    if (node->initialize())
+        rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
 }
