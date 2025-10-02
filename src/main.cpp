@@ -154,7 +154,7 @@ public:
         // NEW: Joystick axis and button mapping parameters
         this->declare_parameter<int>("axis_x", 1); // Fwd/Back on left stick
         this->declare_parameter<int>("axis_y", 0); // Left/Right on left stick
-        this->declare_parameter<int>("axis_z_dpad", 7); // Up/Down on D-pad/hat
+        this->declare_parameter<int>("axis_z_dpad", 5); // Up/Down on D-pad/hat
         this->declare_parameter<int>("button_trigger", 0); // Main trigger button
 
         // Read parameters
