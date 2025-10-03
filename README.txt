@@ -5,7 +5,7 @@ Robot will continue moving for a half second after releasing a key.
 -----------------------------------
 
 xhost +
-sudo docker run --device=/dev/input/js0:/dev/input/js0 -it -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix -v /home/ted:/home/ted --net=host osrf/ros:jazzy-desktop-full
+sudo docker run -it -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix -v /home/ted:/home/ted --net=host osrf/ros:jazzy-desktop-full
 
 source /opt/ros/jazzy/setup.bash
 
@@ -15,5 +15,4 @@ rosdep update
 rosdep install -i --from-path src -y
 source install/setup.bash
 
-chmod a+r /dev/input/js0
 ros2 run rt_control rt_control_node --ros-args -p robot_ip:=192.168.1.31
