@@ -1,3 +1,9 @@
+## Caution with this branch !!!
+
+Robot will continue moving for a half second after releasing a key.
+
+-----------------------------------
+
 xhost +
 sudo docker run --device=/dev/input/js0:/dev/input/js0 -it -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix -v /home/ted:/home/ted --net=host osrf/ros:jazzy-desktop-full
 

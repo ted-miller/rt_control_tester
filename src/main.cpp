@@ -13,14 +13,15 @@
 
 // Linux/Network specific headers
 #include <fcntl.h>
-#include <linux/joystick.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <termios.h>
+#include <stdio.h>
+#include <sys/select.h>
 
-// CHANGED: The packet structure now sends 6 cartesian increments.
-// X, Y, Z in meters; Rx, Ry, Rz in radians.
+
 #pragma pack(push, 1)
 typedef enum
 {
@@ -56,308 +57,264 @@ typedef enum
     TCP_Y,
     TCP_Z,
 
-    TCP_Rx,         //0.0001 degrees
+    TCP_Rx,         //radians
     TCP_Ry,
     TCP_Rz,
     TCP_Re,
 
     TCP_8,          //pulse
 
-    MAX_AXES //maxies
+    MAX_AXES
 } CartesianIndeces;
 
 #define MP_GRP_AXES_NUM 8
 
-//##########################################################################
-//                  !All data is little-endian!
-//##########################################################################
-
 struct RtPacket
 {
     unsigned int sequenceId;
-    
-    //The order of the joints must be in the order of [S L U R B T E 8].
-    //Please note that for seven axis robots, the 'E' joint is phyically
-    //mounted in the middle of the arm. But it must be sent at the end
-    //of the joint array. See JointIndeces enum.
-    //
-    //For joint-space, this will be radians of each joint.
-    //
-    //For cartesian, this will be meters and radians of the TCP.
-    //The order of the joints must be in the order of [X Y Z Rx Ry Rz Re 8].
-    //See CartesianIndeces enum.
-    //Rotations are applied in the order of ZYX.
     double delta[MAX_GROUPS][MP_GRP_AXES_NUM];
-    
-    //Set tool that will be used by motion API (ie: passed by us to mpExRcsIncrementMove(..))
-    //NOTE: this will change the 'motion tool' ONLY for those increments which
-    //      haven't yet been added to the increment queue. See also the ROS 2
-    //      'select_tool' service definition file in motoros2_interfaces.
-    int toolIndex[MAX_GROUPS]; //TOOL 0 - 63
-
+    int toolIndex[MAX_GROUPS];
 } ;
-
-
-//##########################################################################
-//                  !All data is little-endian!
-//##########################################################################
 
 struct RtReply
 {
     unsigned int sequenceEcho;
-
-    //This is indicative of where the robot is physically located.
-    //Please note that this will trail behind the commanded position.
-    //The joint ordering will match that of the original command
-    //packet. See JointIndeces and CartesianIndeces enums.
     double feedbackPositionJoints[MAX_GROUPS][MP_GRP_AXES_NUM];
     double feedbackPositionCartesian[MAX_GROUPS][MP_GRP_AXES_NUM];
-
-    //The command position is the target destination you are instructing
-    //the robot to reach. It's the calculated endpoint based on the sum
-    //of all position increments received from the user.
-    //
-    //This does NOT include the commanded delta from the most recent
-    //command packet.
-    //
-    //This is used to track if the robot's speed is being limited
-    //by the Functional Safety Unit (FSU). It can also be used to
-    //monitor the latency between command and feedback.
     double previousCommandPositionJoints[MAX_GROUPS][MP_GRP_AXES_NUM];
     double previousCommandPositionCartesian[MAX_GROUPS][MP_GRP_AXES_NUM];
-
     bool fsuInterferenceDetected;
 } ;
 #pragma pack(pop)
 
 // Constants
-constexpr int CONTROL_INTERVAL_MS = 4;
+constexpr int CONTROL_INTERVAL_MS = 8;
 constexpr double CONTROL_INTERVAL_S = CONTROL_INTERVAL_MS / 1000.0;
-constexpr double MAX_JOYSTICK_AXIS_VALUE = 32767.0;
-const int MAX_JOYSTICK_AXES = 8;
-const int MAX_JOYSTICK_BUTTONS = 12; // Max buttons to consider
-const int ROBOT_UDP_PORT = 8889; // Standard RT motion port
+const int ROBOT_UDP_PORT = 8889;
+constexpr int MIN_ACTIVE_DURATION_MS = 500;
 
-class JoystickRtController : public rclcpp::Node 
+// Struct to hold the timestamp of the last press for each key
+struct KeyPressTimestamps
+{
+    using TimePoint = std::chrono::steady_clock::time_point;
+    std::atomic<TimePoint> w, s, a, d, r, f; // Translation
+    std::atomic<TimePoint> i, k, j, l, u, o; // Rotation
+};
+
+
+class KeyboardRtController : public rclcpp::Node 
 {
 public:
-    JoystickRtController() : Node("rt_joystick_controller_node"), sequence_id_(0), joystick_fd_(-1), udp_socket_fd_(-1), running_(true), trigger_pressed_(false)
+    KeyboardRtController() : Node("rt_keyboard_controller_node"), sequence_id_(0), udp_socket_fd_(-1), running_(true)
     {
         this->declare_parameter<std::string>("robot_ip", "192.168.1.31");
+        this->declare_parameter<double>("speed_limit_mps", 0.3);
+        this->declare_parameter<double>("rot_speed_limit_dps", 30.0); // 30 deg/sec
         
-        // NEW: Parameters for Cartesian control
-        this->declare_parameter<std::string>("joystick_device", "/dev/input/js0");
-        this->declare_parameter<double>("speed_limit_mps", 0.8);
-        this->declare_parameter<double>("rot_speed_limit_dps", 60.0); // 60 deg/sec
-        //this->declare_parameter<double>("rot_speed_limit_dps", 25.0); // 25 deg/sec
-        
-        // NEW: Joystick axis and button mapping parameters
-        this->declare_parameter<int>("axis_x", 1); // Fwd/Back on left stick
-        this->declare_parameter<int>("axis_y", 0); // Left/Right on left stick
-        this->declare_parameter<int>("axis_z_dpad", 5); // Up/Down on D-pad/hat
-        this->declare_parameter<int>("button_trigger", 0); // Main trigger button
-
-        // Read parameters
         robot_ip_ = this->get_parameter("robot_ip").as_string();
-        joystick_device_ = this->get_parameter("joystick_device").as_string();
         speed_limit_mps_ = this->get_parameter("speed_limit_mps").as_double();
-        axis_x_ = this->get_parameter("axis_x").as_int();
-        axis_y_ = this->get_parameter("axis_y").as_int();
-        axis_z_dpad_ = this->get_parameter("axis_z_dpad").as_int();
-        button_trigger_ = this->get_parameter("button_trigger").as_int();
-
         double rot_speed_dps = this->get_parameter("rot_speed_limit_dps").as_double();
         rot_speed_rps_ = rot_speed_dps * (M_PI / 180.0);
-        
-        // Initialize atomic state arrays
-        for(auto& state : axis_states_) { state.store(0); }
+
+        // Initialize all timestamps to a long time ago
+        auto distant_past = std::chrono::steady_clock::now() - std::chrono::hours(1);
+        key_timestamps_.w.store(distant_past); key_timestamps_.s.store(distant_past);
+        key_timestamps_.a.store(distant_past); key_timestamps_.d.store(distant_past);
+        key_timestamps_.r.store(distant_past); key_timestamps_.f.store(distant_past);
+        key_timestamps_.i.store(distant_past); key_timestamps_.k.store(distant_past);
+        key_timestamps_.j.store(distant_past); key_timestamps_.l.store(distant_past);
+        key_timestamps_.u.store(distant_past); key_timestamps_.o.store(distant_past);
     }
 
-    ~JoystickRtController() 
+    ~KeyboardRtController() 
     {
         running_ = false;
-        if (joystick_thread_.joinable()) {
-            joystick_thread_.join();
+        // Make one last write to stdin to unblock the read() call
+        write(STDIN_FILENO, "q", 1);
+        if (keyboard_thread_.joinable()) {
+            keyboard_thread_.join();
         }
         if (control_thread_.joinable()) {
             control_thread_.join();
         }
 
-        if (joystick_fd_ != -1) { close(joystick_fd_); }
         if (udp_socket_fd_ != -1) { close(udp_socket_fd_); }
+        restore_keyboard_input();
         RCLCPP_INFO(this->get_logger(), "Resources cleaned up. Shutting down.");
     }
 
     bool initialize() 
     {
+        // ROS Service calls (unchanged)
         auto reset_client = this->create_client<motoros2_interfaces::srv::ResetError>("reset_error");
-        RCLCPP_INFO(this->get_logger(), "Waiting for 'reset_error' service...");
         if (!reset_client->wait_for_service(std::chrono::seconds(5))) {
-             RCLCPP_ERROR(this->get_logger(), "Service 'reset_error' not available. Exiting.");
-             rclcpp::shutdown();
-             return false;
+             RCLCPP_ERROR(this->get_logger(), "Service 'reset_error' not available."); return false;
         }
-        auto reset_request = std::make_shared<motoros2_interfaces::srv::ResetError::Request>();
-        auto reset_result_future = reset_client->async_send_request(reset_request);
-        RCLCPP_INFO(this->get_logger(), "Calling ResetError service...");
-        if (rclcpp::spin_until_future_complete(this->get_node_base_interface(), reset_result_future) != rclcpp::FutureReturnCode::SUCCESS) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to call service reset_error");
-            return false;
-        }
-        RCLCPP_INFO(this->get_logger(), "Successfully reset errors.");
+        reset_client->async_send_request(std::make_shared<motoros2_interfaces::srv::ResetError::Request>());
+        RCLCPP_INFO(this->get_logger(), "Resetting errors...");
+        std::this_thread::sleep_for(std::chrono::milliseconds(500)); 
 
         auto stop_traj_client = this->create_client<std_srvs::srv::Trigger>("stop_traj_mode");
-        RCLCPP_INFO(this->get_logger(), "Waiting for 'stop_traj_mode' service...");
         if (!stop_traj_client->wait_for_service(std::chrono::seconds(5))) {
-             RCLCPP_ERROR(this->get_logger(), "Service 'stop_traj_mode' not available. Exiting.");
-             return false;
+             RCLCPP_ERROR(this->get_logger(), "Service 'stop_traj_mode' not available."); return false;
         }
-        auto stop_traj_request = std::make_shared<std_srvs::srv::Trigger::Request>();
-        auto stop_traj_future = stop_traj_client->async_send_request(stop_traj_request);
-        RCLCPP_INFO(this->get_logger(), "Calling StopTrajMode service...");
-        if (rclcpp::spin_until_future_complete(this->get_node_base_interface(), stop_traj_future) != rclcpp::FutureReturnCode::SUCCESS) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to call service stop_traj_mode");
-            return false;
-        }
-        RCLCPP_INFO(this->get_logger(), "Successfully stopped trajectory mode.");
+        stop_traj_client->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
+        RCLCPP_INFO(this->get_logger(), "Stopping trajectory mode...");
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
         client_ = this->create_client<motoros2_interfaces::srv::StartRtMode>("start_rt_mode");
-        RCLCPP_INFO(this->get_logger(), "Waiting for 'start_rt_mode' service...");
         if (!client_->wait_for_service(std::chrono::seconds(5))) {
-             RCLCPP_ERROR(this->get_logger(), "Service 'start_rt_mode' not available. Exiting.");
-             rclcpp::shutdown();
-             return false;
+             RCLCPP_ERROR(this->get_logger(), "Service 'start_rt_mode' not available."); return false;
         }
 
         auto request = std::make_shared<motoros2_interfaces::srv::StartRtMode::Request>();
         request->control_mode.value = motoros2_interfaces::msg::ControlModeEnum::CARTESIAN;
         auto result_future = client_->async_send_request(request);
 
-        RCLCPP_INFO(this->get_logger(), "Calling StartRtMode service...");
         if (rclcpp::spin_until_future_complete(this->get_node_base_interface(), result_future) != rclcpp::FutureReturnCode::SUCCESS) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to call service start_rt_mode");
-            return false;
+            RCLCPP_ERROR(this->get_logger(), "Failed to call service start_rt_mode"); return false;
         }
-
         auto start_rt_mode_result = result_future.get();
-        if (start_rt_mode_result->result_code.value != motoros2_interfaces::msg::MotionReadyEnum::READY)
-        {
-            RCLCPP_ERROR(this->get_logger(), "start_rt_mode returned code %d: %s", 
-                         start_rt_mode_result->result_code.value, start_rt_mode_result->message.c_str());
+        if (start_rt_mode_result->result_code.value != motoros2_interfaces::msg::MotionReadyEnum::READY) {
+            RCLCPP_ERROR(this->get_logger(), "start_rt_mode failed: %s", start_rt_mode_result->message.c_str());
             return false;
         }
 
         RCLCPP_INFO(this->get_logger(), "Successfully started real-time mode.");
-        if (!setup_joystick() || !setup_udp_socket()) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to setup hardware. Shutting down.");
+        
+        if (!setup_keyboard_input() || !setup_udp_socket()) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to setup hardware.");
             return false;
         }
 
-        joystick_thread_ = std::thread(&JoystickRtController::joystick_poll_thread, this);
-        control_thread_ = std::thread(&JoystickRtController::control_loop_thread, this);
+        RCLCPP_INFO(this->get_logger(), "--- Robot Control Keys ---");
+        RCLCPP_INFO(this->get_logger(), "Translation: [w/s] fwd/back, [a/d] left/right, [r/f] up/down");
+        RCLCPP_INFO(this->get_logger(), "Rotation:    [i/k] pitch, [j/l] roll, [u/o] yaw");
+        RCLCPP_INFO(this->get_logger(), "Exit:        [q]");
+
+        keyboard_thread_ = std::thread(&KeyboardRtController::keyboard_poll_thread, this);
+        control_thread_ = std::thread(&KeyboardRtController::control_loop_thread, this);
 
         return true;
     }
 
 private:
-    // UPDATED: This thread now also reads button events.
-    void joystick_poll_thread()
+    // This thread now only updates the timestamp of the last key press.
+    void keyboard_poll_thread()
     {
-        RCLCPP_INFO(this->get_logger(), "Joystick polling thread started.");
-        js_event event;
+        RCLCPP_INFO(this->get_logger(), "Keyboard polling thread started.");
+        
         while(running_)
         {
-            if (read(joystick_fd_, &event, sizeof(event)) > 0)
+            char c = 0;
+            // This is a blocking call; it will wait until a key is pressed.
+            if (read(STDIN_FILENO, &c, 1) > 0)
             {
-                if (event.type & JS_EVENT_AXIS)
-                {
-                    if (event.number < MAX_JOYSTICK_AXES)
-                    {
-                        axis_states_[event.number].store(event.value);
-                    }
-                }
-                else if (event.type & JS_EVENT_BUTTON)
-                {
-                    if (event.number == button_trigger_)
-                    {
-                        trigger_pressed_.store(event.value != 0);
-                    }
+                auto now = std::chrono::steady_clock::now();
+                switch(c) {
+                    case 'w': key_timestamps_.w.store(now); break;
+                    case 's': key_timestamps_.s.store(now); break;
+                    case 'a': key_timestamps_.a.store(now); break;
+                    case 'd': key_timestamps_.d.store(now); break;
+                    case 'r': key_timestamps_.r.store(now); break;
+                    case 'f': key_timestamps_.f.store(now); break;
+                    case 'j': key_timestamps_.j.store(now); break;
+                    case 'l': key_timestamps_.l.store(now); break;
+                    case 'i': key_timestamps_.i.store(now); break;
+                    case 'k': key_timestamps_.k.store(now); break;
+                    case 'u': key_timestamps_.u.store(now); break;
+                    case 'o': key_timestamps_.o.store(now); break;
+                    case 'q': running_ = false; rclcpp::shutdown(); break;
                 }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        RCLCPP_INFO(this->get_logger(), "Joystick polling thread stopped.");
+        RCLCPP_INFO(this->get_logger(), "Keyboard polling thread stopped.");
     }
-
+    
+    // This thread now checks timestamps to determine if a key is "active".
     void control_loop_thread() 
     {
-        RCLCPP_INFO(this->get_logger(), "Control loop thread started.");
+        RCLCPP_INFO(this->get_logger(), "Control loop (UDP) thread started.");
+
+        double trans_increment = speed_limit_mps_ * CONTROL_INTERVAL_S;
+        double rot_increment = rot_speed_rps_ * CONTROL_INTERVAL_S;
+        
+        // Local state for this thread to track the last-seen timestamps
+        KeyPressTimestamps::TimePoint local_last_seen_w, local_last_seen_s, local_last_seen_a, local_last_seen_d, local_last_seen_r, local_last_seen_f;
+        KeyPressTimestamps::TimePoint local_last_seen_i, local_last_seen_k, local_last_seen_j, local_last_seen_l, local_last_seen_u, local_last_seen_o;
+
         while(running_)
         {
             RtPacket packet{};
             packet.sequenceId = sequence_id_++;
-            
-            memset(packet.delta, 0x00, sizeof(packet.delta));
+            memset(packet.delta, 0, sizeof(packet.delta));
 
-            // Get current joystick state
-            double x_axis_val = static_cast<double>(axis_states_[axis_x_].load());
-            double y_axis_val = static_cast<double>(axis_states_[axis_y_].load());
-            double z_dpad_val = static_cast<double>(axis_states_[axis_z_dpad_].load());
-            bool is_rotating = trigger_pressed_.load();
-
-            if (is_rotating)
-            {
-                // --- ROTATION MODE ---
-                // Fwd/Back stick -> Pitch (rotation around Y)
-                packet.delta[0][4] = rot_speed_rps_ * (x_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-                // Left/Right stick -> Roll (rotation around X)
-                packet.delta[0][3] = rot_speed_rps_ * (y_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-                // D-Pad Up/Down -> Yaw (rotation around Z)
-                packet.delta[0][5] = rot_speed_rps_ * (z_dpad_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-            }
-            else
-            {
-                // --- TRANSLATION MODE ---
-                // Fwd/Back stick -> +/- X
-                packet.delta[0][0] = speed_limit_mps_ * (x_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-                // Left/Right stick -> +/- Y
-                packet.delta[0][1] = speed_limit_mps_ * (y_axis_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-                // D-Pad Up/Down -> +/- Z
-                packet.delta[0][2] = speed_limit_mps_ * (z_dpad_val / MAX_JOYSTICK_AXIS_VALUE) * CONTROL_INTERVAL_S;
-            }
+            auto now = std::chrono::steady_clock::now();
             
-            // Send UDP Packet
+            // Lambda to check and update the state for a single key
+            auto is_active = [&](const std::atomic<KeyPressTimestamps::TimePoint>& shared_ts, KeyPressTimestamps::TimePoint& local_ts) {
+                auto shared_val = shared_ts.load();
+                // Check for a new press (rising edge)
+                if (shared_val > local_ts) {
+                    local_ts = shared_val;
+                }
+                // Key is active if the last known press was within the time window
+                return std::chrono::duration_cast<std::chrono::milliseconds>(now - local_ts).count() < MIN_ACTIVE_DURATION_MS;
+            };
+
+            // Build deltas based on which keys are active
+            if (is_active(key_timestamps_.w, local_last_seen_w)) { packet.delta[0][TCP_X] += trans_increment; }
+            if (is_active(key_timestamps_.s, local_last_seen_s)) { packet.delta[0][TCP_X] -= trans_increment; }
+            if (is_active(key_timestamps_.a, local_last_seen_a)) { packet.delta[0][TCP_Y] += trans_increment; }
+            if (is_active(key_timestamps_.d, local_last_seen_d)) { packet.delta[0][TCP_Y] -= trans_increment; }
+            if (is_active(key_timestamps_.r, local_last_seen_r)) { packet.delta[0][TCP_Z] += trans_increment; }
+            if (is_active(key_timestamps_.f, local_last_seen_f)) { packet.delta[0][TCP_Z] -= trans_increment; }
+            
+            if (is_active(key_timestamps_.j, local_last_seen_j)) { packet.delta[0][TCP_Rx] += rot_increment; }
+            if (is_active(key_timestamps_.l, local_last_seen_l)) { packet.delta[0][TCP_Rx] -= rot_increment; }
+            if (is_active(key_timestamps_.i, local_last_seen_i)) { packet.delta[0][TCP_Ry] += rot_increment; }
+            if (is_active(key_timestamps_.k, local_last_seen_k)) { packet.delta[0][TCP_Ry] -= rot_increment; }
+            if (is_active(key_timestamps_.u, local_last_seen_u)) { packet.delta[0][TCP_Rz] += rot_increment; }
+            if (is_active(key_timestamps_.o, local_last_seen_o)) { packet.delta[0][TCP_Rz] -= rot_increment; }
+
+            // Duplicate motion commands to Group 2, as in your uploaded file
+            packet.delta[1][TCP_X] = packet.delta[0][TCP_X];
+            packet.delta[1][TCP_Y] = packet.delta[0][TCP_Y];
+            packet.delta[1][TCP_Z] = packet.delta[0][TCP_Z];
+            packet.delta[1][TCP_Rx] = packet.delta[0][TCP_Rx];
+            packet.delta[1][TCP_Ry] = packet.delta[0][TCP_Ry];
+            packet.delta[1][TCP_Rz] = packet.delta[0][TCP_Rz];
+            
             sendto(udp_socket_fd_, &packet, sizeof(packet), 0, (struct sockaddr*)&robot_addr_, sizeof(robot_addr_));
 
-            // Listen for Reply
             RtReply reply{};
             socklen_t addr_len = sizeof(robot_addr_);
             recvfrom(udp_socket_fd_, &reply, sizeof(reply), 0, (struct sockaddr*)&robot_addr_, &addr_len);
 
-            // Error/mismatch check would go here
-            if (reply.fsuInterferenceDetected)
-                RCLCPP_ERROR(this->get_logger(), "You are being slowed down");
+            if (reply.fsuInterferenceDetected) 
+            {
+                RCLCPP_ERROR(this->get_logger(), "FSU interference detected.");
+            }
         }
-        RCLCPP_INFO(this->get_logger(), "Control loop thread stopped.");
+        RCLCPP_INFO(this->get_logger(), "Control loop (UDP) thread stopped.");
     }
 
-    bool setup_joystick()
-    {
-        joystick_fd_ = open(joystick_device_.c_str(), O_RDONLY | O_NONBLOCK);
-        if (joystick_fd_ < 0) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to open joystick at %s", joystick_device_.c_str());
-            return false;
-        }
-        RCLCPP_INFO(this->get_logger(), "Joystick '%s' opened successfully.", joystick_device_.c_str());
+    bool setup_keyboard_input() {
+        if (tcgetattr(STDIN_FILENO, &oldt_) == -1) return false;
+        newt_ = oldt_;
+        newt_.c_lflag &= ~(ICANON | ECHO);
+        if (tcsetattr(STDIN_FILENO, TCSANOW, &newt_) == -1) return false;
         return true;
     }
+    
+    void restore_keyboard_input() {
+        tcsetattr(STDIN_FILENO, TCSANOW, &oldt_);
+    }
 
-    bool setup_udp_socket() 
-    {
+    bool setup_udp_socket() {
         udp_socket_fd_ = socket(AF_INET, SOCK_DGRAM, 0);
         if (udp_socket_fd_ < 0) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to create UDP socket.");
-            return false;
+            RCLCPP_ERROR(this->get_logger(), "Failed to create UDP socket."); return false;
         }
 
         memset(&robot_addr_, 0, sizeof(robot_addr_));
@@ -365,43 +322,36 @@ private:
         robot_addr_.sin_port = htons(ROBOT_UDP_PORT);
         if (inet_pton(AF_INET, robot_ip_.c_str(), &robot_addr_.sin_addr) <= 0) {
             RCLCPP_ERROR(this->get_logger(), "Invalid robot IP address: %s", robot_ip_.c_str());
-            close(udp_socket_fd_);
-            return false;
+            close(udp_socket_fd_); return false;
         }
         RCLCPP_INFO(this->get_logger(), "UDP socket created for robot at %s:%d", robot_ip_.c_str(), ROBOT_UDP_PORT);
         return true;
     }
 
-    // ROS2 Members
     rclcpp::Client<motoros2_interfaces::srv::StartRtMode>::SharedPtr client_;
-
-    // Configuration Members
     std::string robot_ip_;
-    std::string joystick_device_;
     double speed_limit_mps_;
     double rot_speed_rps_;
-    int axis_x_, axis_y_, axis_z_dpad_, button_trigger_;
     
-    // State & Networking Members
     uint32_t sequence_id_;
-    int joystick_fd_;
     int udp_socket_fd_;
     struct sockaddr_in robot_addr_;
     
-    // Threading Members
-    std::thread joystick_thread_;
+    std::thread keyboard_thread_;
     std::thread control_thread_;
     std::atomic<bool> running_;
-    std::atomic<bool> trigger_pressed_;
-    std::array<std::atomic<int16_t>, MAX_JOYSTICK_AXES> axis_states_;
+
+    KeyPressTimestamps key_timestamps_;
+
+    struct termios oldt_, newt_;
 };
 
 int main(int argc, char** argv) 
 {
     rclcpp::init(argc, argv);
-    auto node = std::make_shared<JoystickRtController>();
-    if (node->initialize())
+    auto node = std::make_shared<KeyboardRtController>();
+    if (node->initialize()) {
         rclcpp::spin(node);
-    rclcpp::shutdown();
+    }
     return 0;
 }
