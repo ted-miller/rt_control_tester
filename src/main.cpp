@@ -22,6 +22,13 @@
 // CHANGED: The packet structure now sends 6 cartesian increments.
 // X, Y, Z in meters; Rx, Ry, Rz in radians.
 #pragma pack(push, 1)
+
+typedef enum
+{
+    PacketType_Joint_Increments = 0,
+    PacketType_Cart_Increments
+} PacketType;
+
 typedef enum
 {
     Group_1 = 0,
@@ -74,6 +81,10 @@ typedef enum
 
 struct RtPacket
 {
+    int version;
+
+    PacketType packetType;
+
     unsigned int sequenceId;
     
     //The order of the joints must be in the order of [S L U R B T E 8].
@@ -95,6 +106,7 @@ struct RtPacket
     //      'select_tool' service definition file in motoros2_interfaces.
     int toolIndex[MAX_GROUPS]; //TOOL 0 - 63
 
+    char reserved[64];
 } ;
 
 
@@ -295,6 +307,11 @@ private:
         while(running_)
         {
             RtPacket packet{};
+
+            packet.version = 1;
+            packet.packetType = PacketType_Cart_Increments;
+            packet.toolIndex[0] = 0;
+
             packet.sequenceId = sequence_id_++;
             
             memset(packet.delta, 0x00, sizeof(packet.delta));
