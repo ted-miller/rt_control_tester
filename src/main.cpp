@@ -159,8 +159,8 @@ public:
         
         // NEW: Parameters for Cartesian control
         this->declare_parameter<std::string>("joystick_device", "/dev/input/js0");
-        this->declare_parameter<double>("speed_limit_mps", 0.8);
-        this->declare_parameter<double>("rot_speed_limit_dps", 60.0); // 60 deg/sec
+        this->declare_parameter<double>("speed_limit_mps", 0.4);
+        this->declare_parameter<double>("rot_speed_limit_dps", 30.0); // 30 deg/sec
         //this->declare_parameter<double>("rot_speed_limit_dps", 25.0); // 25 deg/sec
         
         // NEW: Joystick axis and button mapping parameters
