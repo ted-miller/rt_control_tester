@@ -18,8 +18,16 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <sys/time.h> // For timeval
 
 #pragma pack(push, 1)
+
+typedef enum
+{
+    PacketType_Joint_Increments = 0,
+    PacketType_Cart_Increments
+} PacketType;
+
 typedef enum
 {
     Group_1 = 0,
@@ -64,6 +72,17 @@ typedef enum
     MAX_AXES //maxies
 } CartesianIndeces;
 
+typedef struct
+{
+    int drives_powered;
+    int e_stopped;
+    int in_motion;
+    int play_mode;
+    int motion_possible;
+    int error;
+    int error_code;
+} RobotState;
+
 #define MP_GRP_AXES_NUM 8
 
 //##########################################################################
@@ -72,18 +91,27 @@ typedef enum
 
 struct RtPacket
 {
+    //The version of the command packet must match the value expected
+    //by MotoROS2.
+    int version;
+
+    //The packet type must match the control_mode which was specified
+    //in when invoking the start_rt_mode service.
+    PacketType packetType;
+
+    //Must increment sequentially with each new command packet.
     unsigned int sequenceId;
     
     //The order of the joints must be in the order of [S L U R B T E 8].
     //Please note that for seven axis robots, the 'E' joint is phyically
     //mounted in the middle of the arm. But it must be sent at the end
-    //of the joint array. See JointIndeces enum.
+    //of the joint array. See JointIndices enum.
     //
     //For joint-space, this will be radians of each joint.
     //
     //For cartesian, this will be meters and radians of the TCP.
     //The order of the joints must be in the order of [X Y Z Rx Ry Rz Re 8].
-    //See CartesianIndeces enum.
+    //See CartesianIndices enum.
     //Rotations are applied in the order of ZYX.
     double delta[MAX_GROUPS][MP_GRP_AXES_NUM];
     
@@ -92,6 +120,9 @@ struct RtPacket
     //      haven't yet been added to the increment queue. See also the ROS 2
     //      'select_tool' service definition file in motoros2_interfaces.
     int toolIndex[MAX_GROUPS]; //TOOL 0 - 63
+
+    //Reserved for future expansion
+    char reserved[64];
 
 } ;
 
@@ -104,10 +135,14 @@ struct RtReply
 {
     unsigned int sequenceEcho;
 
+    //Essentially a clone of the /robot_status topic. But decoupled
+    //from the industrial_msgs/RobotStatus type.
+    RobotState state;
+
     //This is indicative of where the robot is physically located.
     //Please note that this will trail behind the commanded position.
     //The joint ordering will match that of the original command
-    //packet. See JointIndeces and CartesianIndeces enums.
+    //packet. See JointIndices and CartesianIndices enums.
     double feedbackPositionJoints[MAX_GROUPS][MP_GRP_AXES_NUM];
     double feedbackPositionCartesian[MAX_GROUPS][MP_GRP_AXES_NUM];
 
@@ -115,15 +150,16 @@ struct RtReply
     //the robot to reach. It's the calculated endpoint based on the sum
     //of all position increments received from the user.
     //
-    //This does NOT include the commanded delta from the most recent
-    //command packet.
-    //
     //This is used to track if the robot's speed is being limited
     //by the Functional Safety Unit (FSU). It can also be used to
     //monitor the latency between command and feedback.
     double previousCommandPositionJoints[MAX_GROUPS][MP_GRP_AXES_NUM];
     double previousCommandPositionCartesian[MAX_GROUPS][MP_GRP_AXES_NUM];
 
+    //If the FSU speed limit is enabled, it can truncate the commanded
+    //delta increments. This flag is an indicator that the *previous*
+    //command cycle was truncated. It does NOT indicate that this most
+    //recent command packet was truncated.
     bool fsuInterferenceDetected;
 } ;
 #pragma pack(pop)
@@ -134,12 +170,13 @@ constexpr double CONTROL_INTERVAL_S = CONTROL_INTERVAL_MS / 1000.0;
 constexpr double MAX_JOYSTICK_AXIS_VALUE = 32767.0;
 const int MAX_JOYSTICK_AXES = 8;
 const int MAX_JOYSTICK_BUTTONS = 12; // Max buttons to consider
-const int ROBOT_UDP_PORT = 8889; // Standard RT motion port
+const int ROBOT_UDP_PORT = 22000; // Standard RT motion port
+const int ROBOT_STATE_UDP_PORT = 22001; // Port for RobotState broadcasts
 
 class JoystickRtController : public rclcpp::Node 
 {
 public:
-    JoystickRtController() : Node("rt_joystick_controller_node"), sequence_id_(0), joystick_fd_(-1), udp_socket_fd_(-1), running_(true), trigger_pressed_(false)
+    JoystickRtController() : Node("rt_joystick_controller_node"), sequence_id_(0), joystick_fd_(-1), udp_socket_fd_(-1), state_udp_socket_fd_(-1), running_(true), trigger_pressed_(false)
     {
         this->declare_parameter<std::string>("robot_ip", "192.168.1.31");
         
@@ -172,7 +209,7 @@ public:
         axis_u_t_ = this->get_parameter("axis_u_t").as_int();
         button_trigger_ = this->get_parameter("button_trigger").as_int();
         
-        // Initialize atomic state arrays
+        // Initialize atomic state arrays 
         for(auto& state : axis_states_) { state.store(0); }
     }
 
@@ -185,9 +222,17 @@ public:
         if (control_thread_.joinable()) {
             control_thread_.join();
         }
+        if (state_listener_thread_.joinable())
+        {
+            state_listener_thread_.join();
+        }
 
         if (joystick_fd_ != -1) { close(joystick_fd_); }
         if (udp_socket_fd_ != -1) { close(udp_socket_fd_); }
+        if (state_udp_socket_fd_ != -1)
+        {
+            close(state_udp_socket_fd_);
+        }
         RCLCPP_INFO(this->get_logger(), "Resources cleaned up. Shutting down.");
     }
 
@@ -250,17 +295,47 @@ public:
         }
 
         RCLCPP_INFO(this->get_logger(), "Successfully started real-time mode.");
-        if (!setup_joystick() || !setup_udp_socket()) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to setup hardware. Shutting down.");
+        
+        if (!setup_joystick() || !setup_udp_socket() || !setup_state_udp_socket())
+        {
+            RCLCPP_ERROR(this->get_logger(), "Failed to setup hardware or network. Shutting down.");
             return false;
         }
 
         joystick_thread_ = std::thread(&JoystickRtController::joystick_poll_thread, this);
         control_thread_ = std::thread(&JoystickRtController::control_loop_thread, this);
+        state_listener_thread_ = std::thread(&JoystickRtController::state_listener_loop_thread, this);
         return true;
     }
 
 private:
+    void state_listener_loop_thread()
+    {
+        RCLCPP_INFO(this->get_logger(), "State listener thread started.");
+        
+        while (running_)
+        {
+            RobotState incoming_state{};
+            struct sockaddr_in sender_addr;
+            socklen_t addr_len = sizeof(sender_addr);
+            
+            ssize_t bytes_read = recvfrom(state_udp_socket_fd_, &incoming_state, sizeof(incoming_state), 0, (struct sockaddr*)&sender_addr, &addr_len);
+            
+            if (bytes_read == sizeof(RobotState))
+            {
+                RCLCPP_INFO(this->get_logger(), "in_motion = %d", incoming_state.in_motion);
+                RCLCPP_INFO(this->get_logger(), "e_stopped = %d", incoming_state.e_stopped);
+                RCLCPP_INFO(this->get_logger(), "drives_powered = %d", incoming_state.drives_powered);
+                RCLCPP_INFO(this->get_logger(), "play_mode = %d", incoming_state.play_mode);
+                RCLCPP_INFO(this->get_logger(), "motion_possible = %d", incoming_state.motion_possible);
+                RCLCPP_INFO(this->get_logger(), "error = %d", incoming_state.error);
+                RCLCPP_INFO(this->get_logger(), "error_code = %d", incoming_state.error_code);
+            }
+        }
+        
+        RCLCPP_INFO(this->get_logger(), "State listener thread stopped.");
+    }
+
     // UPDATED: This thread now also reads button events.
     void joystick_poll_thread()
     {
@@ -296,6 +371,11 @@ private:
         while(running_)
         {
             RtPacket packet{};
+
+            packet.version = 1;
+            packet.packetType = PacketType_Joint_Increments;
+            packet.toolIndex[0] = 0;
+
             packet.sequenceId = sequence_id_++;
             
             memset(packet.delta, 0x00, sizeof(packet.delta));
@@ -325,6 +405,7 @@ private:
             RtReply reply{};
             socklen_t addr_len = sizeof(robot_addr_);
             recvfrom(udp_socket_fd_, &reply, sizeof(reply), 0, (struct sockaddr*)&robot_addr_, &addr_len);
+
 
             // Error/mismatch check would go here
             if (reply.fsuInterferenceDetected)
@@ -364,6 +445,39 @@ private:
         return true;
     }
 
+    bool setup_state_udp_socket()
+    {
+        state_udp_socket_fd_ = socket(AF_INET, SOCK_DGRAM, 0);
+        if (state_udp_socket_fd_ < 0)
+        {
+            RCLCPP_ERROR(this->get_logger(), "Failed to create state UDP socket.");
+            return false;
+        }
+
+        // Add timeout so recvfrom doesn't block infinitely during shutdown
+        //struct timeval tv;
+        //tv.tv_sec = 0;
+        //tv.tv_usec = 100000; // 100ms
+        //setsockopt(state_udp_socket_fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        struct sockaddr_in bind_addr;
+        memset(&bind_addr, 0, sizeof(bind_addr));
+        bind_addr.sin_family = AF_INET;
+        bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        bind_addr.sin_port = htons(ROBOT_STATE_UDP_PORT);
+
+        if (bind(state_udp_socket_fd_, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0)
+        {
+            RCLCPP_ERROR(this->get_logger(), "Failed to bind state UDP socket on port %d.", ROBOT_STATE_UDP_PORT);
+            close(state_udp_socket_fd_);
+            state_udp_socket_fd_ = -1;
+            return false;
+        }
+        
+        RCLCPP_INFO(this->get_logger(), "State UDP socket listening on port %d", ROBOT_STATE_UDP_PORT);
+        return true;
+    }
+
     // ROS2 Members
     rclcpp::Client<motoros2_interfaces::srv::StartRtMode>::SharedPtr client_;
 
@@ -378,11 +492,13 @@ private:
     uint32_t sequence_id_;
     int joystick_fd_;
     int udp_socket_fd_;
+    int state_udp_socket_fd_;
     struct sockaddr_in robot_addr_;
     
     // Threading Members
     std::thread joystick_thread_;
     std::thread control_thread_;
+    std::thread state_listener_thread_;
     std::atomic<bool> running_;
     std::atomic<bool> trigger_pressed_;
     std::array<std::atomic<int16_t>, MAX_JOYSTICK_AXES> axis_states_;
